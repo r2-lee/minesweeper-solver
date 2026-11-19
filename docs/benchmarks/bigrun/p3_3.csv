@@ -1,0 +1,2 @@
+row,col,wins,games,win_rate,guesses_per_game,steps_per_game
+3,3,54568,100000,0.54568,2.652,183.26

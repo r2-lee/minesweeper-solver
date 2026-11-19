@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 嵌入式运行时与第三方库（体积大、二进制、可重新下载）
+runtime/
+site-packages/
+*.pyd
+*.pdb
+
+# 原生加速器编译产物（native/build_*.sh 生成）
+frontier_native*.so
+*.o
+*.obj
+*.exp
+
+# 打包好的启动器与游戏产物（由 PyStand 构建，不入库）
+mine.exe
+
+# 本地运行时数据
+config.json
+results.json
+
+# 编辑器/系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# 临时产物
+*.log
+*.tmp
+build/
+dist/
+deploy.tar.gz
+*.tar.gz
+
+# 外部评审对话记录（不含在公开仓库里）
+新建 文本文档.md

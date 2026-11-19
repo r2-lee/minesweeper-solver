@@ -1,0 +1,1423 @@
+diff --git a/MineSweeperSolver/src/minesweeper/solver/AdaptiveGuessLayouts.java b/MineSweeperSolver/src/minesweeper/solver/AdaptiveGuessLayouts.java
+new file mode 100644
+index 0000000..74bfb18
+--- /dev/null
++++ b/MineSweeperSolver/src/minesweeper/solver/AdaptiveGuessLayouts.java
+@@ -0,0 +1,392 @@
++package minesweeper.solver;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++import minesweeper.structure.Location;
++
++final class AdaptiveGuessLayouts {
++    static final int MAX_LAYOUTS = 40_000;
++    static final byte MINE = 9;
++
++    private static final int UNKNOWN = -1;
++    private static final int CONFIRMED = -2;
++    private static final int MAX_BOARD_CELLS = 4_096;
++    private static final int MAX_UNKNOWNS = 512;
++    private static final int COMPONENT_BUDGET = 1_000_000;
++
++    final Location[] cells;
++    final byte[][] clues;
++
++    private AdaptiveGuessLayouts(Location[] cells, byte[][] clues) {
++        this.cells = cells;
++        this.clues = clues;
++    }
++
++    /**
++     * Expands the posterior from confirmed mines, visible clues, and the game-wide
++     * mine count. The probability engine's count must agree before any result is used.
++     */
++    static AdaptiveGuessLayouts enumerate(BoardState board, int expectedCount) {
++        int width = board.getGameWidth();
++        int height = board.getGameHeight();
++        if (expectedCount < 1 || expectedCount > MAX_LAYOUTS || board.getTestMoveBalance() != 0
++                || width < 1 || height < 1 || (long) width * height > MAX_BOARD_CELLS) {
++            return null;
++        }
++
++        int area = width * height;
++        int[] visible = new int[area];
++        int[] columns = new int[area];
++        Arrays.fill(columns, -1);
++        List<Location> unknown = new ArrayList<>();
++        int confirmed = 0;
++        for (int i = 0; i < area; i++) {
++            int x = i % width;
++            int y = i / width;
++            if (board.isRevealed(x, y)) {
++                int clue = board.getWitnessValue(x, y);
++                if (clue < 0 || clue > 8 || board.isConfirmedMine(x, y)) {
++                    return null;
++                }
++                visible[i] = clue;
++            } else if (board.isConfirmedMine(x, y)) {
++                visible[i] = CONFIRMED;
++                confirmed++;
++            } else {
++                visible[i] = UNKNOWN;
++                columns[i] = unknown.size();
++                unknown.add(board.getLocation(x, y));
++            }
++        }
++
++        int mines = board.getMines() - confirmed;
++        int count = unknown.size();
++        if (count == 0 || count > MAX_UNKNOWNS || mines < 0 || mines > count) {
++            return null;
++        }
++
++        Location[] cells = unknown.toArray(new Location[0]);
++        int[][] neighbors = new int[count][];
++        int[] knownNeighbors = new int[count];
++        int[] parent = new int[count];
++        int[] degrees = new int[count];
++        for (int col = 0; col < count; col++) {
++            parent[col] = col;
++        }
++
++        List<Constraint> constraints = new ArrayList<>();
++        int[] adjacent = new int[8];
++        for (int i = 0; i < area; i++) {
++            if (visible[i] == CONFIRMED) {
++                continue;
++            }
++            int adjacentCount = 0;
++            int known = 0;
++            for (Location neighbor : board.getAdjacentSquaresIterable(board.getLocation(i % width, i / width))) {
++                int index = neighbor.y * width + neighbor.x;
++                if (visible[index] == CONFIRMED) {
++                    known++;
++                } else if (columns[index] >= 0) {
++                    adjacent[adjacentCount++] = columns[index];
++                }
++            }
++            if (visible[i] == UNKNOWN) {
++                neighbors[columns[i]] = Arrays.copyOf(adjacent, adjacentCount);
++                knownNeighbors[columns[i]] = known;
++                continue;
++            }
++
++            int required = visible[i] - known;
++            if (required < 0 || required > adjacentCount) {
++                return null;
++            }
++            if (adjacentCount != 0) {
++                int[] members = Arrays.copyOf(adjacent, adjacentCount);
++                constraints.add(new Constraint(members, required));
++                for (int col : members) {
++                    degrees[col]++;
++                    parent[root(parent, col)] = root(parent, members[0]);
++                }
++            }
++        }
++
++        List<Component> components = new ArrayList<>();
++        Component[] byRoot = new Component[count];
++        int[] outside = new int[count];
++        int outsideCount = 0;
++        for (int col = 0; col < count; col++) {
++            if (degrees[col] == 0) {
++                outside[outsideCount++] = col;
++            } else {
++                int key = root(parent, col);
++                if (byRoot[key] == null) {
++                    byRoot[key] = new Component();
++                    components.add(byRoot[key]);
++                }
++                byRoot[key].columns.add(col);
++            }
++        }
++        for (Constraint constraint : constraints) {
++            byRoot[root(parent, constraint.columns[0])].constraints.add(constraint);
++        }
++
++        // Counts beyond the expected total can never contribute to an accepted result.
++        int limit = expectedCount + 1;
++        WorkBudget budget = new WorkBudget();
++        for (Component component : components) {
++            if (!component.enumerate(degrees, count, mines, limit, budget)) {
++                return null;
++            }
++        }
++
++        int[][] suffix = layoutCounts(components, outsideCount, mines, limit);
++        if (suffix[0][mines] != expectedCount) {
++            return null;
++        }
++
++        byte[][] clues = new byte[count][expectedCount];
++        LayoutWriter writer = new LayoutWriter(components, Arrays.copyOf(outside, outsideCount),
++            suffix, neighbors, knownNeighbors, clues);
++        return writer.writeComponents(0, mines) && writer.written == expectedCount
++            ? new AdaptiveGuessLayouts(cells, clues) : null;
++    }
++
++    private static int root(int[] parent, int col) {
++        while (parent[col] != col) {
++            parent[col] = parent[parent[col]];
++            col = parent[col];
++        }
++        return col;
++    }
++
++    private static int[][] layoutCounts(List<Component> groups, int outsideCount, int mines, int limit) {
++        int[][] suffix = new int[groups.size() + 1][mines + 1];
++        int[] outside = suffix[groups.size()];
++        outside[0] = 1;
++        for (int i = 1; i <= outsideCount; i++) {
++            for (int k = Math.min(mines, i); k > 0; k--) {
++                outside[k] = Math.min(limit, outside[k] + outside[k - 1]);
++            }
++        }
++        for (int i = groups.size() - 1; i >= 0; i--) {
++            List<List<int[]>> options = groups.get(i).placements;
++            for (int used = 0; used < options.size(); used++) {
++                int ways = options.get(used).size();
++                if (ways != 0) {
++                    for (int remaining = 0; remaining <= mines - used; remaining++) {
++                        long more = (long) ways * suffix[i + 1][remaining];
++                        suffix[i][used + remaining] = (int) Math.min(limit, suffix[i][used + remaining] + more);
++                    }
++                }
++            }
++        }
++        return suffix;
++    }
++
++    private static final class Constraint {
++        final int[] columns;
++        final int required;
++
++        Constraint(int[] columns, int required) {
++            this.columns = columns;
++            this.required = required;
++        }
++    }
++
++    private static final class WorkBudget {
++        private int remaining = COMPONENT_BUDGET;
++
++        boolean spend(int cells) {
++            remaining -= cells;
++            return remaining >= 0;
++        }
++    }
++
++    private static final class Component {
++        final List<Integer> columns = new ArrayList<>();
++        final List<Constraint> constraints = new ArrayList<>();
++        final List<List<int[]>> placements = new ArrayList<>();
++
++        boolean enumerate(int[] degrees, int unknownCount, int mines, int limit, WorkBudget budget) {
++            columns.sort((a, b) -> Integer.compare(degrees[b], degrees[a]));
++            int size = columns.size();
++            int minUsed = Math.max(0, mines - (unknownCount - size));
++            int maxUsed = Math.min(mines, size);
++            for (int i = 0; i <= maxUsed; i++) {
++                placements.add(new ArrayList<>());
++            }
++            return new ComponentSearch(this, degrees, minUsed, maxUsed, limit, budget).place(0, 0);
++        }
++    }
++
++    private static final class ComponentSearch {
++        private final Component group;
++        private final int[] order;
++        private final int[][] incident;
++        private final int[] slots;
++        private final int[] required;
++        private final int[] selected;
++        private final int minUsed;
++        private final int maxUsed;
++        private final int limit;
++        private final WorkBudget budget;
++
++        ComponentSearch(Component group, int[] degrees, int minUsed, int maxUsed, int limit, WorkBudget budget) {
++            this.group = group;
++            this.minUsed = minUsed;
++            this.maxUsed = maxUsed;
++            this.limit = limit;
++            this.budget = budget;
++            order = new int[group.columns.size()];
++            incident = new int[order.length][];
++            int[] lookup = new int[degrees.length];
++            int[] fill = new int[order.length];
++            for (int i = 0; i < order.length; i++) {
++                order[i] = group.columns.get(i);
++                lookup[order[i]] = i;
++                incident[i] = new int[degrees[order[i]]];
++            }
++            slots = new int[group.constraints.size()];
++            required = new int[slots.length];
++            for (int i = 0; i < slots.length; i++) {
++                Constraint rule = group.constraints.get(i);
++                slots[i] = rule.columns.length;
++                required[i] = rule.required;
++                for (int col : rule.columns) {
++                    int pos = lookup[col];
++                    incident[pos][fill[pos]++] = i;
++                }
++            }
++            selected = new int[maxUsed];
++        }
++
++        boolean place(int position, int used) {
++            if (!budget.spend(1)) {
++                return false;
++            }
++            if (position == order.length) {
++                List<int[]> bucket = group.placements.get(used);
++                if (bucket.size() < limit) {
++                    if (!budget.spend(used)) {
++                        return false;
++                    }
++                    bucket.add(Arrays.copyOf(selected, used));
++                }
++                return true;
++            }
++
++            int minimum = used + order.length - position == minUsed ? 1 : 0;
++            int maximum = used == maxUsed ? 0 : 1;
++            int[] affected = incident[position];
++            for (int rule : affected) {
++                slots[rule]--;
++                if (required[rule] == 0) {
++                    maximum = 0;
++                } else if (required[rule] > slots[rule]) {
++                    minimum = 1;
++                }
++            }
++            if (minimum == 0 && !place(position + 1, used)) {
++                return false;
++            }
++            if (minimum <= maximum && maximum == 1) {
++                selected[used] = order[position];
++                for (int rule : affected) {
++                    required[rule]--;
++                }
++                if (!place(position + 1, used + 1)) {
++                    return false;
++                }
++                for (int rule : affected) {
++                    required[rule]++;
++                }
++            }
++            for (int rule : affected) {
++                slots[rule]++;
++            }
++            return true;
++        }
++    }
++
++    private static final class LayoutWriter {
++        private final List<Component> groups;
++        private final int[] outside;
++        private final int[][] suffix;
++        private final int[][] adjacent;
++        private final int[] knownAdjacent;
++        private final byte[][] clues;
++        private final boolean[] mines;
++        private int written;
++
++        LayoutWriter(List<Component> groups, int[] outside, int[][] suffix, int[][] adjacent,
++                     int[] knownAdjacent, byte[][] clues) {
++            this.groups = groups;
++            this.outside = outside;
++            this.suffix = suffix;
++            this.adjacent = adjacent;
++            this.knownAdjacent = knownAdjacent;
++            this.clues = clues;
++            this.mines = new boolean[clues.length];
++        }
++
++        boolean writeComponents(int index, int remaining) {
++            if (index == groups.size()) {
++                return writeOutside(0, remaining);
++            }
++            List<List<int[]>> options = groups.get(index).placements;
++            for (int count = 0; count < options.size() && count <= remaining; count++) {
++                if (suffix[index + 1][remaining - count] != 0) {
++                    for (int[] placement : options.get(count)) {
++                        for (int mine : placement) {
++                            mines[mine] = true;
++                        }
++                        if (!writeComponents(index + 1, remaining - count)) {
++                            return false;
++                        }
++                        for (int mine : placement) {
++                            mines[mine] = false;
++                        }
++                    }
++                }
++            }
++            return true;
++        }
++
++        private boolean writeOutside(int start, int remaining) {
++            if (remaining == 0) {
++                return writeLayout();
++            }
++            for (int i = start; i <= outside.length - remaining; i++) {
++                mines[outside[i]] = true;
++                if (!writeOutside(i + 1, remaining - 1)) {
++                    return false;
++                }
++                mines[outside[i]] = false;
++            }
++            return true;
++        }
++
++        private boolean writeLayout() {
++            if (written == clues[0].length) {
++                return false;
++            }
++            for (int col = 0; col < clues.length; col++) {
++                int clue = knownAdjacent[col];
++                if (mines[col]) {
++                    clue = MINE;
++                } else {
++                    for (int neighbor : adjacent[col]) {
++                        if (mines[neighbor]) {
++                            clue++;
++                        }
++                    }
++                }
++                clues[col][written] = (byte) clue;
++            }
++            written++;
++            return true;
++        }
++    }
++}
+diff --git a/MineSweeperSolver/src/minesweeper/solver/AdaptiveGuessSearch.java b/MineSweeperSolver/src/minesweeper/solver/AdaptiveGuessSearch.java
+new file mode 100644
+index 0000000..c307f6a
+--- /dev/null
++++ b/MineSweeperSolver/src/minesweeper/solver/AdaptiveGuessSearch.java
+@@ -0,0 +1,637 @@
++package minesweeper.solver;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.List;
++
++/** Searches the equiprobable layouts consistent with the visible board. */
++final class AdaptiveGuessSearch {
++    private static final int CLUES = 9;
++    private static final int MAX_LAYOUTS = 65_536;
++    private static final int CELL_BITS = 9;
++    private static final int CELL_MASK = (1 << CELL_BITS) - 1;
++    private static final int MASS_SHIFT = CELL_BITS + 4;
++    private static final int COUNT_BITS = 17;
++    private static final long COUNT_MASK = (1L << COUNT_BITS) - 1;
++    private static final long ROLLOUT = 1L << (COUNT_BITS * 2);
++    private static final long BOUND_MASK = (ROLLOUT << 1) - 1;
++
++    static final class Result {
++        final int choice;
++        final boolean triggered;
++        final boolean completed;
++        final long nodes;
++
++        Result(int choice, boolean triggered, boolean completed, long nodes) {
++            this.choice = choice;
++            this.triggered = triggered;
++            this.completed = completed;
++            this.nodes = nodes;
++        }
++    }
++
++    static Result choose(byte[][] clues, int original, int nodeLimit) {
++        int layouts = clues[original].length;
++        if (layouts < 2 || layouts > MAX_LAYOUTS || clues.length > CELL_MASK + 1) {
++            return new Result(original, false, false, 0);
++        }
++        return new AdaptiveGuessSearch(clues, layouts, Math.max(0, nodeLimit)).choose(original);
++    }
++
++    static boolean meetsGate(int originalGreedy, int bestGreedy, int layouts) {
++        long gain = (long) bestGreedy - originalGreedy;
++        return gain > 0 && 200L * gain >= layouts;
++    }
++
++    private final byte[][] clues;
++    private final char[] allWorlds;
++    private final int[] allColumns;
++    private final Frame[] frames;
++    private final Memo memo;
++    private final int nodeLimit;
++    private int nodes;
++    private boolean exhausted;
++
++    private AdaptiveGuessSearch(byte[][] clues, int layouts, int nodeLimit) {
++        this.clues = clues;
++        this.nodeLimit = nodeLimit;
++        allWorlds = new char[layouts];
++        for (int i = 0; i < layouts; i++) {
++            allWorlds[i] = (char) i;
++        }
++        allColumns = new int[clues.length];
++        for (int i = 0; i < clues.length; i++) {
++            allColumns[i] = i;
++        }
++        frames = new Frame[clues.length + 1];
++        memo = new Memo(layouts);
++    }
++
++    private Result choose(int original) {
++        List<Option> options = options(original);
++        Option baseline = options.get(0);
++        int bestGreedy = 0;
++        for (Option option : options) {
++            option.bound = rollout(option.worlds, 0, option.worlds.length, allColumns, clues.length, 0);
++            bestGreedy = Math.max(bestGreedy, lower(option.bound));
++        }
++        if (!meetsGate(lower(baseline.bound), bestGreedy, allWorlds.length)) {
++            return new Result(original, false, false, 0);
++        }
++
++        // Proving that Hill falls below the rollout witness suffices here.
++        refine(baseline, bestGreedy - 1);
++        int best = Math.max(bestGreedy, lower(baseline.bound));
++        Collections.sort(options, new Comparator<Option>() {
++            @Override
++            public int compare(Option a, Option b) {
++                int order = Integer.compare(lower(b.bound), lower(a.bound));
++                if (order == 0) {
++                    order = Integer.compare(upper(a.bound), upper(b.bound));
++                }
++                return order == 0 ? Integer.compare(a.column, b.column) : order;
++            }
++        });
++
++        for (Option option : options) {
++            if (option == baseline || exhausted) {
++                continue;
++            }
++            refresh(option);
++            if (upper(option.bound) > best) {
++                refine(option, best);
++                best = Math.max(best, lower(option.bound));
++            }
++        }
++
++        refresh(baseline);
++        Option selected = baseline;
++        for (Option option : options) {
++            refresh(option);
++            if (lower(option.bound) > upper(baseline.bound)
++                    && (selected == baseline || lower(option.bound) > lower(selected.bound)
++                        || (lower(option.bound) == lower(selected.bound) && option.column < selected.column))) {
++                selected = option;
++            }
++        }
++        boolean completed = !exhausted;
++        for (Option option : options) {
++            if (option != selected && upper(option.bound) > lower(selected.bound)) {
++                completed = false;
++                break;
++            }
++        }
++        return new Result(selected.column, true, completed, nodes);
++    }
++
++    private void refine(Option option, int cut) {
++        refresh(option);
++        if (upper(option.bound) > cut) {
++            long refined = search(option.worlds, 0, option.worlds.length, allColumns,
++                    clues.length, cut, 0);
++            option.bound = intersect(option.bound, refined);
++        }
++    }
++
++    private void refresh(Option option) {
++        option.bound = intersect(option.bound,
++                known(option.worlds, 0, option.worlds.length, option.hash));
++    }
++
++    private List<Option> options(int original) {
++        int baselineMass = 0;
++        int safest = original;
++        int maximumMass = -1;
++        int[] ordered = new int[clues.length];
++        int candidates = 0;
++        for (int cell = 0; cell < clues.length; cell++) {
++            byte[] observations = clues[cell];
++            if (observations.length != allWorlds.length) {
++                throw new IllegalArgumentException("Unequal adaptive layout counts");
++            }
++            int safe = 0;
++            int digits = 0;
++            for (byte clue : observations) {
++                if (clue < CLUES) {
++                    safe++;
++                    digits |= 1 << clue;
++                }
++            }
++            if (cell == original) {
++                baselineMass = safe;
++            }
++            if (safe > maximumMass) {
++                maximumMass = safe;
++                safest = cell;
++            }
++            if (Integer.bitCount(digits) > 1) {
++                ordered[candidates++] = rank(cell, safe, 0);
++            }
++        }
++
++        List<Option> result = new ArrayList<Option>();
++        result.add(option(original, baselineMass));
++        if (safest != original) {
++            result.add(option(safest, maximumMass));
++        }
++        List<Option> maximal = new ArrayList<Option>();
++        Arrays.sort(ordered, 0, candidates);
++        for (int i = candidates - 1; i >= 0; i--) {
++            int cell = cell(ordered[i]);
++            Option candidate = cell == original ? result.get(0)
++                    : cell == safest ? result.get(1) : option(cell, mass(ordered[i]));
++            boolean contained = false;
++            for (Option previous : maximal) {
++                if (contains(previous.worlds, candidate.worlds)) {
++                    contained = true;
++                    break;
++                }
++            }
++            if (!contained) {
++                maximal.add(candidate);
++                if (cell != original && cell != safest) {
++                    result.add(candidate);
++                }
++            }
++        }
++        return result;
++    }
++
++    private Option option(int column, int size) {
++        if (size == allWorlds.length) {
++            return new Option(column, allWorlds);
++        }
++        char[] worlds = new char[size];
++        int index = 0;
++        byte[] observations = clues[column];
++        for (int i = 0; i < observations.length; i++) {
++            if (observations[i] < CLUES) {
++                worlds[index++] = (char) i;
++            }
++        }
++        return new Option(column, worlds);
++    }
++
++    private static boolean contains(char[] superset, char[] subset) {
++        if (superset.length < subset.length) {
++            return false;
++        }
++        int i = 0;
++        for (char world : subset) {
++            while (i < superset.length && superset[i] < world) {
++                i++;
++            }
++            if (i == superset.length || superset[i] != world) {
++                return false;
++            }
++            i++;
++        }
++        return true;
++    }
++
++    private long rollout(char[] worlds, int start, int size, int[] columns, int count, int depth) {
++        long hash = hash(worlds, start, size);
++        long previous = known(worlds, start, size, hash);
++        if (exact(previous) || (previous & ROLLOUT) != 0) {
++            return previous;
++        }
++        Frame frame = frame(depth);
++        int action = fill(frame, worlds, start, size, columns, count);
++        if (action == 0) {
++            return save(worlds, start, size, hash, bounds(1, 1) | ROLLOUT, previous, false);
++        }
++        partition(frame, worlds, start, size, action);
++        boolean certain = mass(action) == size;
++        int[] active = certain ? columns : frame.active;
++        int activeCount = certain ? count : frame.actionsCount;
++        int lo = 0;
++        int hi = 0;
++        for (int digit = 0; digit < CLUES; digit++) {
++            long child = rollout(frame.partitions, frame.offset[digit], frame.counts[digit],
++                    active, activeCount, depth + 1);
++            lo += lower(child);
++            hi += upper(child);
++        }
++        long outcome = bounds(lo, certain ? hi : mass(action)) | ROLLOUT;
++        return save(worlds, start, size, hash, outcome, previous, false);
++    }
++
++    private long search(char[] worlds, int start, int size, int[] columns, int count, int cut, int depth) {
++        long hash = hash(worlds, start, size);
++        long previous = known(worlds, start, size, hash);
++        if (exact(previous) || upper(previous) <= cut || exhausted) {
++            return previous;
++        }
++        if (nodes == nodeLimit) {
++            exhausted = true;
++            return previous;
++        }
++        nodes++;
++        Frame frame = frame(depth);
++        int first = fill(frame, worlds, start, size, columns, count);
++        if (first == 0) {
++            return save(worlds, start, size, hash, bounds(1, 1), previous, true);
++        }
++        if (mass(first) == size) {
++            long scores = score(frame, worlds, start, size, columns, count, first, cut, depth);
++            return save(worlds, start, size, hash, scores, previous, true);
++        }
++
++        int lo = lower(previous);
++        int hi = lo;
++        int seen = 0;
++        Arrays.sort(frame.actions, 0, frame.actionsCount);
++        for (int i = frame.actionsCount - 1; i >= 0; i--) {
++            int action = frame.actions[i];
++            int threshold = Math.max(cut, lo);
++            if (mass(action) <= threshold || exhausted) {
++                hi = Math.max(hi, mass(action));
++                break;
++            }
++            int column = cell(action);
++            if (dominated(worlds, start, size, column, frame.explored, seen)) {
++                continue;
++            }
++            frame.explored[seen++] = column;
++            long alternative = score(frame, worlds, start, size, frame.active,
++                    frame.actionsCount, action, threshold, depth);
++            lo = Math.max(lo, lower(alternative));
++            hi = Math.max(hi, upper(alternative));
++            if (lo == upper(previous)) {
++                hi = lo;
++                break;
++            }
++        }
++        return save(worlds, start, size, hash, bounds(lo, hi), previous, true);
++    }
++
++    private long score(Frame frame, char[] worlds, int start, int size, int[] columns,
++            int count, int action, int cut, int depth) {
++        partition(frame, worlds, start, size, action);
++        int lo = 0;
++        int hi = 0;
++        int branches = 0;
++        for (int digit = 0; digit < CLUES; digit++) {
++            int offset = frame.offset[digit];
++            int length = frame.counts[digit];
++            if (length == 0) {
++                continue;
++            }
++            long hash = hash(frame.partitions, offset, length);
++            long prior = known(frame.partitions, offset, length, hash);
++            frame.prior[digit] = prior;
++            lo += lower(prior);
++            hi += upper(prior);
++            if (!exact(prior)) {
++                int i = branches++;
++                while (i > 0 && frame.counts[frame.order[i - 1]] < length) {
++                    frame.order[i] = frame.order[i - 1];
++                    i--;
++                }
++                frame.order[i] = digit;
++            }
++        }
++        for (int i = 0; i < branches && hi > cut && !exhausted; i++) {
++            int digit = frame.order[i];
++            long prior = frame.prior[digit];
++            long child = search(frame.partitions, frame.offset[digit], frame.counts[digit],
++                    columns, count, cut - (hi - upper(prior)), depth + 1);
++            lo += lower(child) - lower(prior);
++            hi += upper(child) - upper(prior);
++        }
++        return bounds(lo, hi);
++    }
++
++    private int fill(Frame frame, char[] worlds, int start, int size, int[] columns, int count) {
++        int best = 0;
++        frame.actionsCount = 0;
++        for (int i = 0; i < count; i++) {
++            int column = columns[i];
++            byte[] observations = clues[column];
++            int alive = 0;
++            int digits = 0;
++            for (int w = start; w < start + size; w++) {
++                byte clue = observations[worlds[w]];
++                if (clue < CLUES) {
++                    alive++;
++                    digits |= 1 << clue;
++                }
++            }
++            int distinct = Integer.bitCount(digits);
++            if (distinct > 1) {
++                int action = rank(column, alive, distinct);
++                if (alive == size) {
++                    // Column lists keep row-major order for risk-free tie-breaking.
++                    return action;
++                }
++                int next = frame.actionsCount++;
++                frame.active[next] = column;
++                frame.actions[next] = action;
++                best = Math.max(best, action);
++            }
++        }
++        return best;
++    }
++
++    private void partition(Frame frame, char[] worlds, int start, int size, int action) {
++        byte[] observations = clues[cell(action)];
++        Arrays.fill(frame.counts, 0);
++        for (int i = start; i < start + size; i++) {
++            int digit = observations[worlds[i]];
++            if (digit < CLUES) {
++                frame.counts[digit]++;
++            }
++        }
++        int offset = 0;
++        for (int digit = 0; digit < CLUES; digit++) {
++            frame.offset[digit] = offset;
++            frame.next[digit] = offset;
++            offset += frame.counts[digit];
++        }
++        if (frame.partitions.length < offset) {
++            frame.partitions = new char[Math.max(offset, frame.partitions.length * 2)];
++        }
++        for (int i = start; i < start + size; i++) {
++            char world = worlds[i];
++            int digit = observations[world];
++            if (digit < CLUES) {
++                frame.partitions[frame.next[digit]++] = world;
++            }
++        }
++    }
++
++    private boolean dominated(char[] worlds, int start, int size, int column, int[] seen, int count) {
++        byte[] current = clues[column];
++        for (int i = 0; i < count; i++) {
++            byte[] earlier = clues[seen[i]];
++            int w = start;
++            for (; w < start + size; w++) {
++                char world = worlds[w];
++                if (current[world] < CLUES && earlier[world] == CLUES) {
++                    break;
++                }
++            }
++            if (w == start + size) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    private long known(char[] worlds, int start, int size, long hash) {
++        if (size <= 1) {
++            return bounds(size, size);
++        }
++        long value = memo.get(worlds, start, size, hash);
++        return value == 0 ? bounds(1, size) : value;
++    }
++
++    private long save(char[] worlds, int start, int size, long hash, long value, long prior, boolean deep) {
++        long span = intersect(value, prior);
++        if (!memo.put(worlds, start, size, hash, span) && deep) {
++            exhausted = true;
++        }
++        return span;
++    }
++
++    private Frame frame(int depth) {
++        if (frames[depth] == null) {
++            frames[depth] = new Frame(clues.length);
++        }
++        return frames[depth];
++    }
++
++    // Rank sorts by safe mass, number of observed digits, then row-major order.
++    private static int rank(int column, int mass, int digits) {
++        return (mass << MASS_SHIFT) | (digits << CELL_BITS) | (CELL_MASK - column);
++    }
++
++    private static int cell(int rank) {
++        return CELL_MASK - (rank & CELL_MASK);
++    }
++
++    private static int mass(int rank) {
++        return rank >>> MASS_SHIFT;
++    }
++
++    private static long bounds(int lo, int hi) {
++        return ((long) hi << COUNT_BITS) | lo;
++    }
++
++    private static int lower(long bound) {
++        return (int) (bound & COUNT_MASK);
++    }
++
++    private static int upper(long bound) {
++        return (int) ((bound >>> COUNT_BITS) & COUNT_MASK);
++    }
++
++    private static boolean exact(long bound) {
++        return lower(bound) == upper(bound);
++    }
++
++    private static long intersect(long a, long b) {
++        int lo = Math.max(lower(a), lower(b));
++        int hi = Math.min(upper(a), upper(b));
++        if (lo > hi) {
++            throw new IllegalStateException("Inconsistent adaptive search bounds");
++        }
++        return bounds(lo, hi) | ((a | b) & ROLLOUT);
++    }
++
++    private static long hash(char[] worlds, int start, int size) {
++        if (size <= 1) {
++            return 0;
++        }
++        long hash = 0xcbf29ce484222325L;
++        for (int i = start; i < start + size; i++) {
++            hash = (hash ^ worlds[i]) * 0x100000001b3L;
++        }
++        hash ^= hash >>> 32;
++        hash *= 0xd6e8feb86659fd93L;
++        return (hash ^ (hash >>> 32)) | 1;
++    }
++
++    private static final class Option {
++        final int column;
++        final char[] worlds;
++        final long hash;
++        long bound;
++
++        Option(int column, char[] worlds) {
++            this.column = column;
++            this.worlds = worlds;
++            hash = hash(worlds, 0, worlds.length);
++        }
++    }
++
++    private static final class Frame {
++        final int[] actions;
++        final int[] active;
++        final int[] explored;
++        final int[] counts = new int[CLUES];
++        final int[] offset = new int[CLUES];
++        final int[] next = new int[CLUES];
++        final int[] order = new int[CLUES];
++        final long[] prior = new long[CLUES];
++        char[] partitions = new char[0];
++        int actionsCount;
++
++        Frame(int cells) {
++            actions = new int[cells];
++            active = new int[cells];
++            explored = new int[cells];
++        }
++    }
++
++    /** Stores immutable world sets and checks equality on every hash match. */
++    private static final class Memo {
++        private static final int MEMORY_LIMIT = 96 << 20;
++        private static final int SLOT_BYTES = 20;
++        private static final int SIZE_SHIFT = COUNT_BITS * 2 + 1;
++        private final int chunkBits;
++        private final int chunkSize;
++        private final ArrayList<char[]> chunks = new ArrayList<char[]>();
++        private long[] hashes = new long[256];
++        private int[] offsets = new int[256];
++        private long[] values = new long[256];
++        private int entries;
++        private int next;
++
++        Memo(int worlds) {
++            chunkBits = 32 - Integer.numberOfLeadingZeros(Math.max(4_096, worlds) - 1);
++            chunkSize = 1 << chunkBits;
++            next = chunkSize;
++        }
++
++        long get(char[] worlds, int start, int size, long hash) {
++            return values[slot(worlds, start, size, hash)] & BOUND_MASK;
++        }
++
++        boolean put(char[] worlds, int start, int size, long hash, long value) {
++            int slot = slot(worlds, start, size, hash);
++            if (hashes[slot] != 0) {
++                values[slot] = value | ((long) size << SIZE_SHIFT);
++                return true;
++            }
++            if ((entries + 1) * 4 > hashes.length * 3) {
++                if (!grow()) {
++                    return false;
++                }
++                slot = slot(worlds, start, size, hash);
++            }
++            if (next + size > chunkSize) {
++                if (!canAllocate(chunkSize * 2)) {
++                    return false;
++                }
++                chunks.add(new char[chunkSize]);
++                next = 0;
++            }
++            System.arraycopy(worlds, start, chunks.get(chunks.size() - 1), next, size);
++            hashes[slot] = hash;
++            offsets[slot] = ((chunks.size() - 1) << chunkBits) | next;
++            values[slot] = value | ((long) size << SIZE_SHIFT);
++            next += size;
++            entries++;
++            return true;
++        }
++
++        private int slot(char[] worlds, int start, int size, long hash) {
++            int mask = hashes.length - 1;
++            int slot = (int) (hash >>> 1) & mask;
++            while (hashes[slot] != 0) {
++                if (hashes[slot] == hash && values[slot] >>> SIZE_SHIFT == size
++                        && matches(worlds, start, size, offsets[slot])) {
++                    break;
++                }
++                slot = (slot + 1) & mask;
++            }
++            return slot;
++        }
++
++        private boolean matches(char[] worlds, int start, int size, int offset) {
++            char[] stored = chunks.get(offset >>> chunkBits);
++            int index = offset & (chunkSize - 1);
++            for (int i = 0; i < size; i++) {
++                if (worlds[start + i] != stored[index + i]) {
++                    return false;
++                }
++            }
++            return true;
++        }
++
++        private boolean canAllocate(int bytes) {
++            long used = (long) hashes.length * SLOT_BYTES + (long) chunks.size() * chunkSize * 2;
++            return used + bytes <= MEMORY_LIMIT;
++        }
++
++        private boolean grow() {
++            int capacity = hashes.length * 2;
++            if (!canAllocate(capacity * SLOT_BYTES)) {
++                return false;
++            }
++            long[] oldHashes = hashes;
++            int[] oldOffsets = offsets;
++            long[] oldValues = values;
++            hashes = new long[capacity];
++            offsets = new int[capacity];
++            values = new long[capacity];
++            int mask = capacity - 1;
++            for (int i = 0; i < oldHashes.length; i++) {
++                long hash = oldHashes[i];
++                if (hash != 0) {
++                    int next = (int) (hash >>> 1) & mask;
++                    while (hashes[next] != 0) {
++                        next = (next + 1) & mask;
++                    }
++                    hashes[next] = hash;
++                    offsets[next] = oldOffsets[i];
++                    values[next] = oldValues[i];
++                }
++            }
++            return true;
++        }
++    }
++}
+diff --git a/MineSweeperSolver/src/minesweeper/solver/Solver.java b/MineSweeperSolver/src/minesweeper/solver/Solver.java
+index 45762a5..c80bd62 100644
+--- a/MineSweeperSolver/src/minesweeper/solver/Solver.java
++++ b/MineSweeperSolver/src/minesweeper/solver/Solver.java
+@@ -142,6 +142,17 @@ public class Solver implements Asynchronous<Action[]> {
+ 	private ProbabilityEngineModel pe;
+ 	private BruteForce bf;
+ 
++	private static final int ADAPTIVE_NODE_LIMIT = 1_300_000;
++	private static final BigInteger ADAPTIVE_LAYOUT_LIMIT = BigInteger.valueOf(AdaptiveGuessLayouts.MAX_LAYOUTS);
++	private boolean adaptiveGuessPending;
++	private long adaptiveScreened;
++	private long adaptiveTriggered;
++	private long adaptiveCompleted;
++	private long adaptiveChanged;
++	private long adaptiveEnumerationRejected;
++	private long adaptiveSearchNanos;
++	private long adaptiveDeepNodes;
++
+ 	private BruteForceAnalysisModel bruteForceAnalysis;
+ 	private LocationEvaluator evaluateLocations;
+ 
+@@ -280,6 +291,15 @@ public class Solver implements Asynchronous<Action[]> {
+ 	}    
+ 	// end of Asynchronous methods
+ 
++	/**
++	 * A snapshot of adaptive decisions: screened, triggered, completed, changed,
++	 * enumeration rejected, total adaptive nanoseconds, and deep search nodes.
++	 */
++	public long[] getAdaptiveGuessStats() {
++		return new long[] {adaptiveScreened, adaptiveTriggered, adaptiveCompleted,
++				adaptiveChanged, adaptiveEnumerationRejected, adaptiveSearchNanos, adaptiveDeepNodes};
++	}
++
+ 	//public BigDecimal getWinValue() {
+ 	//	return this.winValue;
+ 	//}
+@@ -356,7 +376,11 @@ public class Solver implements Asynchronous<Action[]> {
+ 
+ 	private FinalMoves newProcess() {
+ 
++		adaptiveGuessPending = false;
+ 		FinalMoves fm = doNewProcess();
++		if (adaptiveGuessPending) {
++			fm = reconsiderGuess(fm);
++		}
+ 
+ 		if (fm.result.length > 0) {
+ 			newLine("---------- Recommended Move ----------");
+@@ -373,6 +397,67 @@ public class Solver implements Asynchronous<Action[]> {
+ 	}
+ 
+ 
++	private FinalMoves reconsiderGuess(FinalMoves fallback) {
++		if (fallback.result.length != 1 || fallback.result[0].getAction() != Action.CLEAR
++				|| fallback.result[0].isCertainty() || boardState.getTestMoveBalance() != 0) {
++			return fallback;
++		}
++		BigInteger layouts = pe.getSolutionCount();
++		if (layouts.compareTo(BigInteger.ONE) <= 0 || layouts.compareTo(ADAPTIVE_LAYOUT_LIMIT) > 0) {
++			return fallback;
++		}
++
++		long start = System.nanoTime();
++		try {
++			int count = layouts.intValue();
++			AdaptiveGuessLayouts position = AdaptiveGuessLayouts.enumerate(boardState, count);
++			if (position == null) {
++				adaptiveEnumerationRejected++;
++				return fallback;
++			}
++
++			int original = 0;
++			while (original < position.cells.length && !position.cells[original].equals(fallback.result[0])) {
++				original++;
++			}
++			if (original == position.cells.length) {
++				adaptiveEnumerationRejected++;
++				return fallback;
++			}
++
++			adaptiveScreened++;
++			AdaptiveGuessSearch.Result result = AdaptiveGuessSearch.choose(position.clues, original, ADAPTIVE_NODE_LIMIT);
++			if (result.triggered) {
++				adaptiveTriggered++;
++				adaptiveDeepNodes += result.nodes;
++				if (result.completed) {
++					adaptiveCompleted++;
++				}
++			}
++			if (result.choice == original) {
++				return fallback;
++			}
++
++			Location tile = position.cells[result.choice];
++			int safe = 0;
++			for (byte clue : position.clues[result.choice]) {
++				if (clue != AdaptiveGuessLayouts.MINE) {
++					safe++;
++				}
++			}
++			BigDecimal safety = BigDecimal.valueOf(safe).divide(BigDecimal.valueOf(count), DP, RoundingMode.HALF_UP);
++			Action move = new Action(tile, Action.CLEAR, MoveMethod.ADAPTIVE_DEEP_ANALYSIS, "", safety);
++			adaptiveChanged++;
++			// The original move is an uncertain suggestion, which BoardState drops on its next process().
++			if (boardState.isFlagOnBoard(tile)) {
++				return new FinalMoves(new Action(tile, Action.FLAG, MoveMethod.CORRECTION, "Remove flag", BigDecimal.ONE, 0), move);
++			}
++			return new FinalMoves(move);
++		} finally {
++			adaptiveSearchNanos += System.nanoTime() - start;
++		}
++	}
++
+ 	private FinalMoves doNewProcess() {
+ 
+ 		this.logger.log(Level.INFO, "--- Starting Analysis ---");
+@@ -867,6 +952,12 @@ public class Solver implements Asynchronous<Action[]> {
+ 			this.logger.log(Level.INFO, "----- Brute Force finished -----");        	
+ 		}
+ 
++		// Apply the gate to the original fallback guess after the normal whole-board analysis.
++		if (preferences.isAdaptiveGuess() && !certainClearFound && !fm.moveFound) {
++			adaptiveGuessPending = bf == null || !bf.hasRun() || (!bf.hasCertainClear()
++					&& (bruteForceAnalysis == null || !bruteForceAnalysis.isComplete()));
++		}
++
+ 		// look for unavoidable 50/50
+ 		//FiftyFiftyHelper fiftyFiftyHelper = null;
+ 		/*
+diff --git a/MineSweeperSolver/src/minesweeper/solver/settings/SettingsFactory.java b/MineSweeperSolver/src/minesweeper/solver/settings/SettingsFactory.java
+index d28d6f3..2f5c5c7 100644
+--- a/MineSweeperSolver/src/minesweeper/solver/settings/SettingsFactory.java
++++ b/MineSweeperSolver/src/minesweeper/solver/settings/SettingsFactory.java
+@@ -14,6 +14,7 @@ public class SettingsFactory {
+ 		BRUTE_FORCE_100K,
+ 		BRUTE_FORCE_200K,
+ 		BRUTE_FORCE_400K,
++		LARGE_ADAPTIVE_ANALYSIS,
+ 		;
+ 	}
+ 	
+@@ -25,6 +26,8 @@ public class SettingsFactory {
+ 			return tinyAnalysis();
+ 		} else if (setting == Setting.LARGE_ANALYSIS) {
+ 			return largeAnalysis();
++		} else if (setting == Setting.LARGE_ADAPTIVE_ANALYSIS) {
++			return largeAnalysis().setAdaptiveGuess(true);
+ 		} else if (setting == Setting.NO_BRUTE_FORCE) {
+ 			return noBruteForce();
+ 		} else if (setting == Setting.VERY_LARGE_ANALYSIS) {
+diff --git a/MineSweeperSolver/src/minesweeper/solver/settings/SolverSettings.java b/MineSweeperSolver/src/minesweeper/solver/settings/SolverSettings.java
+index f0ac8c7..9fe1b55 100644
+--- a/MineSweeperSolver/src/minesweeper/solver/settings/SolverSettings.java
++++ b/MineSweeperSolver/src/minesweeper/solver/settings/SolverSettings.java
+@@ -59,6 +59,18 @@ public class SolverSettings {
+     protected int bruteForceInitCache = 10000;
+     
+     private boolean locked;
++    private boolean adaptiveGuess;
++
++    public boolean isAdaptiveGuess() {
++        return adaptiveGuess;
++    }
++
++    public SolverSettings setAdaptiveGuess(boolean enabled) {
++        if (!locked) {
++            adaptiveGuess = enabled;
++        }
++        return this;
++    }
+     
+     public SolverSettings lockSettings() {
+     	locked = true;
+diff --git a/MineSweeperSolver/test/minesweeper/solver/AdaptiveGuessSearchTest.java b/MineSweeperSolver/test/minesweeper/solver/AdaptiveGuessSearchTest.java
+new file mode 100644
+index 0000000..075caa9
+--- /dev/null
++++ b/MineSweeperSolver/test/minesweeper/solver/AdaptiveGuessSearchTest.java
+@@ -0,0 +1,187 @@
++package minesweeper.solver;
++
++import java.io.BufferedReader;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Paths;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Random;
++
++public class AdaptiveGuessSearchTest {
++    public static void main(String[] args) throws Exception {
++        check(AdaptiveGuessSearch.meetsGate(4, 5, 200), "accept the exact 0.5-point threshold");
++        check(!AdaptiveGuessSearch.meetsGate(4, 5, 201), "reject one win out of 201");
++        check(!AdaptiveGuessSearch.meetsGate(4, 4, 100), "do not trigger on ties");
++        verifySyntheticCases();
++        for (String path : args) {
++            verifyRealCase(path);
++        }
++        System.out.println("AdaptiveGuessSearch focused tests passed");
++    }
++
++    private static void verifySyntheticCases() {
++        byte[][] tied = matrix("M1", "1M");
++        AdaptiveGuessSearch.Result result = AdaptiveGuessSearch.choose(tied, 0, 1_000);
++        check(result.choice == 0 && !result.triggered && result.nodes == 0,
++                "leave a dead 50/50 with the baseline");
++
++        byte[][] improved = matrix("M111", "0M11", "21M1");
++        result = AdaptiveGuessSearch.choose(improved, 1, 1_000);
++        check(result.choice == 0 && result.triggered && result.completed,
++                "zero is informative and can certify a winning change");
++
++        Random random = new Random(590748L);
++        int triggered = 0;
++        int incomplete = 0;
++        for (int i = 0; i < 240; i++) {
++            int cells = 4 + random.nextInt(4);
++            int mines = 1 + random.nextInt(cells - 1);
++            List<Integer> layouts = new ArrayList<Integer>();
++            for (int mask = 1; mask < (1 << cells); mask++) {
++                if (Integer.bitCount(mask) == mines) {
++                    layouts.add(mask);
++                }
++            }
++            Collections.shuffle(layouts, random);
++            int count = Math.min(2 + random.nextInt(17), layouts.size());
++            byte[][] clues = new byte[cells][count];
++            for (int c = 0; c < cells; c++) {
++                for (int w = 0; w < count; w++) {
++                    clues[c][w] = (byte) ((layouts.get(w) & (1 << c)) != 0 ? 9 : random.nextInt(4));
++                }
++            }
++            ExactReference ref = new ExactReference(clues);
++            int original = random.nextInt(cells);
++            int originalScore = ref.forced(original);
++            if (originalScore == 0) {
++                continue;
++            }
++            int optimum = ref.optimal();
++            AdaptiveGuessSearch.Result ample = AdaptiveGuessSearch.choose(clues, original, 100_000);
++            AdaptiveGuessSearch.Result limited = AdaptiveGuessSearch.choose(clues, original, 1);
++            for (AdaptiveGuessSearch.Result attempt : new AdaptiveGuessSearch.Result[]{ample, limited}) {
++                if (attempt.choice != original) {
++                    check(ref.forced(attempt.choice) > originalScore,
++                            "every changed move must beat the exact baseline");
++                }
++                if (attempt.completed && attempt.triggered) {
++                    check(ref.forced(attempt.choice) == optimum, "completed search returns the exact optimum");
++                }
++            }
++            check(limited.nodes <= 1, "deep search obeys the node limit");
++            check(ample.triggered == limited.triggered, "rollout gate is independent of deep budget");
++            if (ample.triggered) {
++                check(ample.completed, "small triggered matrix completed within a generous budget");
++                triggered++;
++                if (!limited.completed) {
++                    incomplete++;
++                }
++            } else {
++                check(ample.choice == original && ample.nodes == 0, "closed gate performs no deep work");
++            }
++        }
++        check(triggered > 5 && incomplete > 0, "fixtures exercise triggered and budget paths");
++        System.out.println("Synthetic cases included " + triggered + " triggered and " + incomplete + " budget cases");
++    }
++
++    private static void verifyRealCase(String path) throws Exception {
++        try (BufferedReader input = Files.newBufferedReader(Paths.get(path), StandardCharsets.US_ASCII)) {
++            String[] header = input.readLine().split("\\s+");
++            int worlds = Integer.parseInt(header[0]);
++            int cells = Integer.parseInt(header[1]);
++            int original = Integer.parseInt(header[2]);
++            byte[][] clues = new byte[cells][worlds];
++            for (int c = 0; c < cells; c++) {
++                String column = input.readLine();
++                check(column.length() == worlds, "matrix has the expected world count");
++                for (int w = 0; w < worlds; w++) {
++                    clues[c][w] = (byte) (column.charAt(w) == 'M' ? 9 : column.charAt(w) - '0');
++                }
++            }
++            AdaptiveGuessSearch.Result result = AdaptiveGuessSearch.choose(clues, original, 1_300_000);
++            if (!result.triggered) {
++                check(result.choice == original && result.nodes == 0, "real position preserves closed gate");
++            }
++            check(result.nodes <= 1_300_000, "real position honors the cap");
++            System.out.println(path + " choice=" + result.choice + " trigger=" + result.triggered
++                    + " completed=" + result.completed + " nodes=" + result.nodes);
++        }
++    }
++
++    private static byte[][] matrix(String... rows) {
++        byte[][] clues = new byte[rows[0].length()][rows.length];
++        for (int w = 0; w < rows.length; w++) {
++            for (int c = 0; c < clues.length; c++) {
++                char glyph = rows[w].charAt(c);
++                clues[c][w] = (byte) (glyph == 'M' ? 9 : glyph - '0');
++            }
++        }
++        return clues;
++    }
++
++    private static void check(boolean condition, String message) {
++        if (!condition) {
++            throw new AssertionError(message);
++        }
++    }
++
++    private static final class ExactReference {
++        private final byte[][] clues;
++        private final long all;
++        private final Map<Long, Integer> values = new HashMap<Long, Integer>();
++
++        ExactReference(byte[][] clues) {
++            this.clues = clues;
++            this.all = (1L << clues[0].length) - 1;
++        }
++
++        int optimal() {
++            return value(all);
++        }
++
++        int forced(int cell) {
++            long safe = 0;
++            for (int w = 0; w < clues[cell].length; w++) {
++                if (clues[cell][w] < 9) {
++                    safe |= 1L << w;
++                }
++            }
++            return value(safe);
++        }
++
++        int value(long belief) {
++            if (Long.bitCount(belief) <= 1) {
++                return belief == 0 ? 0 : 1;
++            }
++            Integer seen = values.get(belief);
++            if (seen != null) {
++                return seen;
++            }
++            int best = 1;
++            for (byte[] column : clues) {
++                long[] digits = new long[9];
++                for (long left = belief; left != 0; left &= left - 1) {
++                    int world = Long.numberOfTrailingZeros(left);
++                    if (column[world] < 9) {
++                        digits[column[world]] |= 1L << world;
++                    }
++                }
++                int score = 0;
++                for (long group : digits) {
++                    if (group == belief) {
++                        score = 0;
++                        break;
++                    }
++                    score += value(group);
++                }
++                best = Math.max(score, best);
++            }
++            values.put(belief, best);
++            return best;
++        }
++    }
++}
+diff --git a/MinesweeperGameState/src/minesweeper/gamestate/MoveMethod.java b/MinesweeperGameState/src/minesweeper/gamestate/MoveMethod.java
+index a433a9b..fb5610c 100644
+--- a/MinesweeperGameState/src/minesweeper/gamestate/MoveMethod.java
++++ b/MinesweeperGameState/src/minesweeper/gamestate/MoveMethod.java
+@@ -13,7 +13,8 @@ public enum MoveMethod {
+ 	GUESS("Guess"),
+ 	ROLLOUT("Rollout"),
+ 	UNAVOIDABLE_GUESS("Unavoidable Guess"),
+-	CHEAT("Cheat");
++	CHEAT("Cheat"),
++	ADAPTIVE_DEEP_ANALYSIS("Adaptive Deep Analysis");
+ 	
+ 	public final String description;
+ 	

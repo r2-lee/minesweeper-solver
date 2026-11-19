@@ -1,0 +1,61 @@
+{
+  "n": 10000,
+  "baseline_wins": 5475,
+  "adaptive_wins": 5483,
+  "both_won": 5465,
+  "both_lost": 4507,
+  "only_baseline_won": 10,
+  "only_adaptive_won": 18,
+  "difference_pp": 0.08,
+  "paired_bootstrap_95_pp": [
+    -0.02,
+    0.19
+  ],
+  "baseline_wall_seconds": 138.3285781,
+  "adaptive_wall_seconds": 174.27935,
+  "wall_difference_seconds": 35.95077190000001,
+  "wall_relative_increase_pct": 25.98940319766072,
+  "baseline_mean_game_ms": 107.27035943,
+  "adaptive_mean_game_ms": 136.86029468,
+  "workers": 8,
+  "warmup": 192,
+  "adaptive_statistics": {
+    "screened": 489,
+    "triggered": 198,
+    "completed": 128,
+    "changed": 120,
+    "enumeration_rejected": 0,
+    "adaptive_nanos": 266381172900,
+    "deep_nodes": 92536438
+  },
+  "games_with_change": 114,
+  "games_with_trigger": 177,
+  "seed_20261118": {
+    "n": 5000,
+    "baseline_wins": 2721,
+    "adaptive_wins": 2723,
+    "both_won": 2716,
+    "both_lost": 2272,
+    "only_baseline_won": 5,
+    "only_adaptive_won": 7,
+    "difference_pp": 0.04,
+    "paired_bootstrap_95_pp": [
+      -0.1,
+      0.18
+    ]
+  },
+  "seed_20261119": {
+    "n": 5000,
+    "baseline_wins": 2754,
+    "adaptive_wins": 2760,
+    "both_won": 2749,
+    "both_lost": 2235,
+    "only_baseline_won": 5,
+    "only_adaptive_won": 11,
+    "difference_pp": 0.12,
+    "paired_bootstrap_95_pp": [
+      -0.04,
+      0.28
+    ]
+  }
+}
